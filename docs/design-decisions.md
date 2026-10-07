@@ -1,8 +1,47 @@
-# KK2.1.5 MP3 Player: Design Decisions
+# MP3 Player: Design Decisions
 
-Project: repurpose a KK2.1.5 flight controller board as an MP3 player.
+Project: an MP3 player built around a DFPlayer Mini.
 
-## Goal
+## Direction change: ESP32-C3 Mini replaces the KK2.1.5
+
+The KK2.1.5 stopped answering over the ISP after a failed flash (signature reads `00 00 00`
+with power, ground, signal lines and wire order all verified; an 8 MHz clock injection on
+XTAL1 did not revive it). The player now uses an **ESP32-C3 Mini**, a DFPlayer Mini, an I2C
+OLED and a speaker. Everything below that describes the KK2 (sections "Pin map", "Package pin
+numbers", "Programming the board", "Backup of the stock firmware", the KK2 stages, the LCD
+layout for the ST7565) is kept as a record of the KK2 work and is superseded by the section
+"ESP32-C3 build" unless a note says otherwise. The KK2 backup in `backups/kk2-1-5-original/` stays
+valid if the board is ever revived.
+
+## ESP32-C3 build
+
+Power:
+- USB-C 5 V to the ESP32-C3 5V / VBUS pin.
+- ESP32-C3 3.3 V to DFPlayer VCC and to OLED VCC.
+- All grounds connected together.
+
+Connections:
+
+| DFPlayer Mini | ESP32-C3 |
+|---|---|
+| VCC | 3.3 V |
+| GND | GND |
+| TX | ESP32 RX |
+| RX | ESP32 TX |
+| SPK1 / SPK2 | 8 ohm 0.5 W speaker (the two terminals; neither goes to ground) |
+
+| OLED | ESP32-C3 |
+|---|---|
+| VCC | 3.3 V |
+| GND | GND |
+| SDA | GPIO6 |
+| SCL | GPIO7 |
+
+Open points for this build (see the review notes in the conversation): DFPlayer supply
+voltage and current, speaker power rating against the amplifier, which UART pins are used
+for the DFPlayer, how the player is controlled (buttons), and the OLED controller type.
+
+## Goal (original KK2 plan)
 
 Play MP3 files from a microSD card, controlled with the board's four buttons and
 shown on its LCD, with audio out to wired earphones.
@@ -80,6 +119,32 @@ family, so confirm on this board with a test sketch before relying on it.
 | MPU-6050 | PC0 (SCL), PC1 (SDA) | I2C, unused |
 | Receiver inputs | Throttle PD0, aileron/elevator PD2 and PD3, rudder PB0, aux PB2 | Aileron and elevator are INT0 and INT1 |
 | Motor outputs M1 to M8 | PC6, PC4, PC2, PC3, PA4, PA5, PC7, PC5 | Spare general-purpose pins |
+
+### Package pin numbers (TQFP-44, 10 x 10 mm)
+
+Pin 1 is at the dot or indent corner; numbering runs counter-clockwise, 11 pins per side.
+Checked against the official KiCad symbol for the ATmega164A/PA, 324, 644A/PA and 1284 family
+(footprint `TQFP-44_10x10mm_P0.8mm`).
+
+| Pin | Signal | Pin | Signal | Pin | Signal |
+|---|---|---|---|---|---|
+| 1 | PB5 (MOSI) | 16 | PD7 (LCD A0) | 31 | PA6 |
+| 2 | PB6 (MISO) | 17 | VCC | 32 | PA5 |
+| 3 | PB7 (SCK) | 18 | GND | 33 | PA4 |
+| 4 | RESET | 19 | PC0 (SCL) | 34 | PA3 (battery sense) |
+| 5 | VCC | 20 | PC1 (SDA) | 35 | PA2 |
+| 6 | GND | 21 | PC2 | 36 | PA1 |
+| 7 | XTAL2 | 22 | PC3 | 37 | PA0 |
+| 8 | XTAL1 | 23 | PC4 | 38 | VCC |
+| 9 | PD0 | 24 | PC5 | 39 | GND |
+| 10 | PD1 (LCD data) | 25 | PC6 | 40 | PB0 |
+| 11 | PD2 (UART1 RX) | 26 | PC7 | 41 | PB1 (buzzer) |
+| 12 | PD3 (UART1 TX) | 27 | AVCC | 42 | PB2 |
+| 13 | PD4 (LCD clock) | 28 | GND | 43 | PB3 (LED) |
+| 14 | PD5 (LCD CS) | 29 | AREF | 44 | PB4 (Enter button) |
+| 15 | PD6 (LCD reset) | 30 | PA7 | | |
+
+Buttons: Back PB7 is pin 3, Up PB6 is pin 2, Down PB5 is pin 1, Enter PB4 is pin 44.
 
 Consequences:
 
