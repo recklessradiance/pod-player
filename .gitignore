@@ -1,1 +1,3 @@
 player/secrets.h
+__pycache__/
+*.pyc
