@@ -90,9 +90,11 @@ Consequences:
   buttons while flashing, and keep them as inputs in the firmware.
 - **Battery warning:** channel 3 reads the battery connector, so it reflects the real
   supply only if the player is powered from that input.
-- **Still to test on the board:** physical button order, buzzer type (active or passive),
-  battery divider ratio, LCD controller variant and contrast, LCD backlight control (no
-  pin found).
+- **Confirmed on the board** with `hardware-test/` (flashed through the Uno ISP): the LED
+  on PB3, the buzzer on PB1 and the four buttons on PB4 to PB7 work as mapped.
+- **Still to test on the board:** buzzer type (active or passive; not yet recorded), exact
+  physical button order, battery divider ratio, LCD controller variant and contrast, LCD
+  backlight control (no pin found).
 
 Button handling: a 1 kHz timer interrupt samples the buttons and runs a debounce
 state machine (idle, pressed, held, released), so the LCD and serial link never block it.
@@ -195,7 +197,7 @@ Do not rewrite fuses from the backup unless the chip stops responding.
 
 ## Stages
 
-1. Toolchain: install MightyCore, build and flash a blink and buzzer test through the Uno ISP.
+1. Toolchain: install MightyCore, build and flash a blink and buzzer test through the Uno ISP. Done (MightyCore 3.1.0, board `MightyCore:avr:644`, 20 MHz external clock, no bootloader; `hardware-test/` flashed and verified). Upload only. Never "Burn Bootloader", which would change the fuses.
 2. Map the board's pins: done from the stock firmware source and a second source (see "Pin map"). Remaining: confirm on the board with a test sketch.
 3. LCD and button handling (U8g2, debounce, long press).
 4. DFPlayer link: play, pause, next, previous, volume.
