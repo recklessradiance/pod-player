@@ -43,9 +43,56 @@ so KK2 TX goes to module RX through a 1 kohm resistor. Module needs a stable 5 V
 A long press gives a beep so it can be confirmed without looking at the LCD.
 Repeat mode is shown as an icon on the LCD. "Stop" was dropped; pause does the same job.
 
-Which physical button gets which role is decided in Stage 2, after the real pin
-mapping is confirmed. Suggested: ENTER for play/pause, the rest by position, with vol+ and vol- adjacent.
-Timings are tunable constants.
+Physical buttons, left to right: Back (PB7), Up (PB6), Down (PB5), Menu/Enter (PB4).
+Proposed assignment (not final):
+
+| Physical button | Role |
+|---|---|
+| Up | Vol + |
+| Down | Vol - |
+| Enter (rightmost) | Play/pause |
+| Back (leftmost) | Next |
+
+Up and Down are adjacent, so the volume buttons sit together. Timings are tunable constants.
+
+## Pin map (ATmega644PA)
+
+Sources: the stock KK2 firmware source (`daltonmatos/kk2-firmware`, files `hardware.asm`,
+`setuphw.asm`, `io.c`, `sensorreading.asm`; no license, used only for pin facts) and a
+second source, `aheyer/KK_Programmer_Replacement` (CC BY-SA 4.0), whose author traced the
+LCD and button pins on a KK2.1HC with a multimeter. The two agree. Both are for the KK2
+family, so confirm on this board with a test sketch before relying on it.
+
+| Part | Pin(s) | Notes |
+|---|---|---|
+| LCD clock (SCLK) | PD4 | ST7565, SPI mode 3 (CPOL 1, CPHA 1); bit-banged in stock firmware |
+| LCD data (MOSI) | PD1 | Also UART0 TX, so UART0 is not usable for the DFPlayer |
+| LCD chip select | PD5 | |
+| LCD reset | PD6 | |
+| LCD A0 | PD7 | |
+| Button Back | PB7 | Active low, internal pull-up. Shares the ISP SCK line |
+| Button Up | PB6 | Active low. Shares the ISP MISO line |
+| Button Down | PB5 | Active low. Shares the ISP MOSI line |
+| Button Menu/Enter | PB4 | Active low |
+| Buzzer | PB1 | Stock firmware only switches it on and off, so probably an active buzzer. To be tested |
+| LED | PB3 | |
+| Battery sense | ADC channel 3 (PA3) | Divider ratio not in the source; stock firmware calibrates with an offset |
+| MPU-6050 | PC0 (SCL), PC1 (SDA) | I2C, unused |
+| Receiver inputs | Throttle PD0, aileron/elevator PD2 and PD3, rudder PB0, aux PB2 | Aileron and elevator are INT0 and INT1 |
+| Motor outputs M1 to M8 | PC6, PC4, PC2, PC3, PA4, PA5, PC7, PC5 | Spare general-purpose pins |
+
+Consequences:
+
+- **DFPlayer link:** use UART1, PD2 (RX) and PD3 (TX), on the aileron and elevator header
+  pins. They are free if no receiver is connected. Which header pin is which still has to
+  be found from the board labels or a continuity check.
+- **Buttons and ISP:** PB5, PB6 and PB7 are the ISP MOSI, MISO and SCK lines. Do not press
+  buttons while flashing, and keep them as inputs in the firmware.
+- **Battery warning:** channel 3 reads the battery connector, so it reflects the real
+  supply only if the player is powered from that input.
+- **Still to test on the board:** physical button order, buzzer type (active or passive),
+  battery divider ratio, LCD controller variant and contrast, LCD backlight control (no
+  pin found).
 
 Button handling: a 1 kHz timer interrupt samples the buttons and runs a debounce
 state machine (idle, pressed, held, released), so the LCD and serial link never block it.
@@ -113,17 +160,21 @@ considered: large track number, animated equalizer, cassette, minimal, vinyl, de
 
 Programmer: Arduino Uno running the ArduinoISP sketch (`arduino-isp/`).
 
-| Uno pin | KK2 ISP header pin |
+| Uno pin | KK2 ISP signal |
 |---|---|
-| D12 | 1 MISO |
-| 5V | 2 VCC |
-| D13 | 3 SCK |
-| D11 | 4 MOSI |
-| D10 | 5 RESET |
-| GND | 6 GND |
+| D12 | MISO |
+| 5V | VCC |
+| D13 | SCK |
+| D11 | MOSI |
+| D10 | RESET |
+| GND | GND |
 
-Pin 1 is the marked corner of the header. Optional 10 uF capacitor between the Uno's
-RESET and GND, after uploading the sketch.
+The header is a 2x3 block. Its adjacent pairs are MISO next to VCC, SCK next to MOSI and
+RESET next to GND. Pin numbers differ by source: the KK2.1HC author numbers it
+1 MISO, 2 SCK, 3 RST, 4 VCC, 5 MOSI, 6 GND, while the standard AVR numbering is
+1 MISO, 2 VCC, 3 SCK, 4 MOSI, 5 RST, 6 GND. It is the same physical arrangement, so rely
+on the signal pairs, not the numbers. The wiring used here works (signature read verified).
+Optional 10 uF capacitor between the Uno's RESET and GND, after uploading the sketch.
 
 Verified working: signature `1E 96 0A` read with
 
@@ -145,7 +196,7 @@ Do not rewrite fuses from the backup unless the chip stops responding.
 ## Stages
 
 1. Toolchain: install MightyCore, build and flash a blink and buzzer test through the Uno ISP.
-2. Map the board's pins: LCD, buttons, buzzer, LED, and free pins for the DFPlayer serial link. Use the KK2 schematic or open-source firmware; do not guess.
+2. Map the board's pins: done from the stock firmware source and a second source (see "Pin map"). Remaining: confirm on the board with a test sketch.
 3. LCD and button handling (U8g2, debounce, long press).
 4. DFPlayer link: play, pause, next, previous, volume.
 5. Player UI on the LCD.
@@ -157,6 +208,7 @@ and a 1 kohm resistor. Stage 6 needs a 3.5 mm jack and two 100 ohm resistors.
 
 ## Open questions
 
-- Real pin mapping (Stage 2), including which UART or pins are free for the DFPlayer.
+- Confirming the pin map on the board, and which header pins are aileron (PD2/PD3) for the DFPlayer link.
+- Final button assignment.
 - Final power source.
 - Whether to add Bluetooth later.
