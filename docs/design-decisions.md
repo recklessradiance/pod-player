@@ -41,6 +41,63 @@ Open points for this build (see the review notes in the conversation): DFPlayer 
 voltage and current, speaker power rating against the amplifier, which UART pins are used
 for the DFPlayer, how the player is controlled (buttons), and the OLED controller type.
 
+## Player firmware: behavior, guardrails and operation
+
+Source: `player/` (`player.ino`, `config.h`, `web_page.h`). Test: `tools/test_controls.py`.
+
+**Controls (web page)**: previous, play, pause, stop, next, volume slider, repeat (off / all / one),
+jump to a track, rescan the SD card, change the Wi-Fi network. Next and previous always start the
+neighbouring track (wrapping at the ends), whether playing, paused or stopped. Play while playing
+and pause while paused do nothing.
+
+**Playback guardrails**
+- Every frame to the DFPlayer goes through a queue with a minimum gap (`DF_CMD_GAP_MS`), because
+  clone chips drop commands that arrive too close together.
+- A track change while something plays sends stop first, then play (`DF_STOP_GAP_MS` apart);
+  starting a track over a playing one is unreliable on these modules.
+- Tracks start by position (command `0x03`, `PLAY_BY_INDEX 1`), so file names do not matter. The
+  module counts every file on the card, so keep only the tracks on it. On a Mac, remove the hidden
+  `._*` copies with `dot_clean` before using the card.
+- A missing file (error 6) skips in the direction of travel, at most `MAX_MISSING_SKIPS` times in
+  a row, then stops and says so.
+- "Track finished" messages that arrive within `FINISH_IGNORE_MS` of starting a track are ignored.
+- Nothing claims to be playing when there is no module, no card or no tracks. The OLED and the
+  page show which of those it is.
+- Track changes closer than `TRACK_CHANGE_MIN_MS` are refused (HTTP 429).
+- Volume is clamped to `VOLUME_MAX`; track numbers are checked against the card.
+
+**Web API guardrails**: actions are POST only and must carry the header `X-Pod: 1`, so a page from
+another site cannot press the buttons (the browser would need a preflight this device never
+grants). Numeric arguments are parsed strictly; bad input gets HTTP 400 and sends nothing.
+
+**Reliability**
+- Task watchdog (`WDT_TIMEOUT_MS`, 15 s): the board restarts if the main loop stalls.
+- USB serial logging never blocks (`Serial.setTxTimeoutMs(0)`), so an unplugged board is not slowed.
+- Wi-Fi: reconnects when the link drops and follows IP changes. In fallback hotspot mode it retries
+  the saved network every `NET_RETRY_MS`, so it comes back by itself after a power cut.
+- Hotspot password is unique per device (`pod-` + 6 hex digits of the chip ID) and shown on the
+  OLED while the setup portal is open. Set `AP_PASSWORD` in `config.h` to override.
+- Status and health JSON use fixed buffers (no heap churn over long uptimes).
+- `/api/health`: uptime, free and lowest heap, signal strength, last reset reason, boot and crash
+  counters, DFPlayer frame counters, queue drops, Wi-Fi rejoins.
+- Logging: `LOG_LEVEL` 0 off, 1 events (default), 2 also every DFPlayer frame.
+
+**Testing**: build with `--build-property "compiler.cpp.extra_flags=-DLOG_LEVEL=2"`, flash, put the
+Mac on the same network as the player and connect it by USB, then run
+`python3 tools/test_controls.py http://<player-ip>`. It presses every control through the web API
+and checks the frames the board sends to the DFPlayer, the reported state, input refusal, the
+rate limit, the header check and frame spacing. Audio plays while it runs.
+
+**Known limits and unverified items**
+- Natural end of a track (`0x3D` "finished", which drives auto-advance and repeat) has not been
+  verified on this module. Test with a very short track. If a module does not send it, auto-advance
+  would stall. The reliable fix is wiring the DFPlayer BUSY pin to a free GPIO.
+- DFPlayer on 3.3 V gives limited volume. The 0.5 W speaker is easy to overdrive, so keep
+  `VOLUME_MAX` modest.
+- Files must be 16-bit PCM MP3 at 22.05, 44.1 or 48 kHz; other rates are skipped by the chip.
+- A 1 kohm resistor in the ESP32 TX to DFPlayer RX wire reduces clicks.
+- Not done by choice: over-the-air updates, splitting the firmware into modules, host-side unit tests.
+
 ## Goal (original KK2 plan)
 
 Play MP3 files from a microSD card, controlled with the board's four buttons and

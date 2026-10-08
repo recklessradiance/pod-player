@@ -27,9 +27,13 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <U8g2lib.h>
+#include <esp_task_wdt.h>
 
 #include "config.h"
 #include "web_page.h"
+
+#define LOGE(...) do { if (LOG_LEVEL >= 1) Serial.printf(__VA_ARGS__); } while (0)
+#define LOGD(...) do { if (LOG_LEVEL >= 2) Serial.printf(__VA_ARGS__); } while (0)
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL_PIN, OLED_SDA_PIN);
 WebServer server(80);
@@ -45,6 +49,16 @@ static uint16_t currentTrack = 1;
 static uint16_t trackCount = TRACK_COUNT_OVERRIDE;
 static bool wifiSta = false;
 static String ipText = "0.0.0.0";
+
+// Counters reported by /api/health.
+static struct {
+  uint32_t txFrames, rxFrames, queueDrops, rejoins, boots, crashes;
+} stats;
+static const char *resetReason = "unknown";
+
+// Hotspot password: unique per device unless config.h sets one.
+static char apPass[16];
+
 
 // ---------------------------------------------------------------- DFPlayer / SD status
 
@@ -116,7 +130,8 @@ static void dfWrite(uint8_t cmd, uint16_t param = 0) {
   f[7] = sum >> 8;
   f[8] = sum & 0xFF;
   Serial1.write(f, sizeof(f));
-  Serial.printf("DF tx: cmd 0x%02X param %u\n", cmd, param);
+  stats.txFrames++;
+  LOGD("DF tx: cmd 0x%02X param %u\n", cmd, param);
 }
 
 static uint8_t dfQueueFree() {
@@ -124,7 +139,10 @@ static uint8_t dfQueueFree() {
 }
 
 static bool dfEnqueue(uint8_t cmd, uint16_t param = 0, uint16_t gapAfter = DF_CMD_GAP_MS) {
-  if (qCount >= DF_QUEUE_SIZE) return false;
+  if (qCount >= DF_QUEUE_SIZE) {
+    stats.queueDrops++;
+    return false;
+  }
   dfQueue[(qHead + qCount) % DF_QUEUE_SIZE] = {cmd, param, gapAfter};
   qCount++;
   return true;
@@ -233,14 +251,15 @@ static void onMissingTrack() {
   if (skipDir != 0 && skipsLeft > 0) {
     skipsLeft--;
     uint16_t n = skipDir > 0 ? nextTrackNumber() : prevTrackNumber();
-    Serial.printf("Track %u not found, trying %u\n", currentTrack, n);
+    LOGE("Track %u not found, trying %u\n", currentTrack, n);
     if (requestTrack(n, skipDir, true, false)) return;
   }
   state = STOPPED;                                         // nothing playable found: stop honestly
 }
 
 static void dfHandle(uint8_t cmd, uint16_t param) {
-  Serial.printf("DF rx: cmd 0x%02X param %u\n", cmd, param);
+  stats.rxFrames++;
+  LOGD("DF rx: cmd 0x%02X param %u\n", cmd, param);
   dfSeen = true;
   switch (cmd) {
     case 0x3D:                     // finished playing a track on the SD card
@@ -275,6 +294,7 @@ static void dfHandle(uint8_t cmd, uint16_t param) {
       break;
     case 0x48:                     // reply: number of files on the SD card
       if (param == 0 && sdFlag == 0) break;        // no card: nothing to count
+      if (param > 9999) break;                     // not a plausible count: ignore the frame
       sdFlag = 1;
       if (TRACK_COUNT_OVERRIDE == 0) {
         trackCount = param;
@@ -321,7 +341,7 @@ static void dfPoll() {
 // ---------------------------------------------------------------- saved state
 
 static void loadState() {
-  prefs.begin("player", false);
+  if (!prefs.begin("player", false)) LOGE("Saved settings unavailable; using defaults\n");
   volume = prefs.getUChar("vol", VOLUME_DEFAULT);
   if (volume > VOLUME_MAX) volume = VOLUME_MAX;
   currentTrack = prefs.getUShort("trk", 1);
@@ -396,6 +416,14 @@ static void drawScreen() {
 
 // ---------------------------------------------------------------- network
 
+static void makeApPassword() {
+  if (strlen(AP_PASSWORD) >= 8) {
+    snprintf(apPass, sizeof(apPass), "%s", AP_PASSWORD);
+  } else {
+    snprintf(apPass, sizeof(apPass), "pod-%06X", (unsigned)(ESP.getEfuseMac() & 0xFFFFFF));
+  }
+}
+
 static void startNetwork() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
@@ -409,22 +437,103 @@ static void startNetwork() {
   wm.setConfigPortalTimeout(PORTAL_TIMEOUT_S);
   wm.setAPCallback([](WiFiManager *) {
     // Called when the setup hotspot opens.
-    showMessage("Join Wi-Fi:", AP_SSID, "pass: " AP_PASSWORD);
-    Serial.println("Setup hotspot open: join " AP_SSID " and pick your network.");
+    char line[32];
+    snprintf(line, sizeof(line), "pass: %s", apPass);
+    showMessage("Join Wi-Fi:", AP_SSID, line);
+    LOGE("Setup hotspot open: join %s (password %s) and pick your network.\n", AP_SSID, apPass);
   });
 
-  if (wm.autoConnect(AP_SSID, AP_PASSWORD)) {
+  if (wm.autoConnect(AP_SSID, apPass)) {
     wifiSta = true;
     ipText = WiFi.localIP().toString();
   } else {
     // Nothing joined before the portal timed out: plain hotspot with the control page.
     WiFi.disconnect(true);
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    WiFi.softAP(AP_SSID, apPass);
     wifiSta = false;
     ipText = WiFi.softAPIP().toString();
   }
   if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", 80);
+}
+
+// Keeps the connection alive:
+// - on the home network: reconnect when the link drops, and follow IP address changes;
+// - in fallback hotspot mode: periodically try the saved network again, so the player comes
+//   back by itself after a power cut where the router was slower to start than the player.
+static void netTick() {
+  static uint32_t lastRetry = 0;
+  static uint32_t lastIpCheck = 0;
+  static uint32_t tryStart = 0;
+  static bool trying = false;
+  uint32_t now = millis();
+
+  if (wifiSta) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (now - lastIpCheck > 5000) {
+        lastIpCheck = now;
+        String ip = WiFi.localIP().toString();
+        if (ip != ipText) ipText = ip;
+      }
+    } else if (now - lastRetry > 10000) {
+      lastRetry = now;
+      stats.rejoins++;
+      LOGE("Wi-Fi link lost, reconnecting\n");
+      WiFi.reconnect();
+    }
+    return;
+  }
+
+  if (!trying) {
+    if (now - lastRetry > NET_RETRY_MS) {
+      lastRetry = now;
+      trying = true;
+      tryStart = now;
+      stats.rejoins++;
+      LOGE("Trying the saved Wi-Fi again\n");
+      WiFi.mode(WIFI_AP_STA);                 // keep the hotspot up while trying
+      WiFi.begin();                           // saved credentials
+    }
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    trying = false;
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    wifiSta = true;
+    ipText = WiFi.localIP().toString();
+    MDNS.end();
+    if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", 80);
+    LOGE("Rejoined the saved Wi-Fi: http://%s/\n", ipText.c_str());
+  } else if (now - tryStart > NET_JOIN_MS) {
+    trying = false;
+    WiFi.disconnect(false);                   // give up for now; the hotspot stays up
+  }
+}
+
+static const char *resetReasonText() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "task watchdog";
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    default:                return "other";
+  }
+}
+
+static bool resetWasCrash() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_PANIC: case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT: case ESP_RST_BROWNOUT:
+      return true;
+    default:
+      return false;
+  }
 }
 
 // ---------------------------------------------------------------- web API
@@ -435,22 +544,32 @@ static void sendStatus(int code = 200, const char *msg = nullptr) {
   LinkState ls = linkState();
   const char *lk = ls == LINK_OK ? "ok" : ls == LINK_EMPTY ? "empty" : ls == LINK_NO_SD ? "no_sd"
                  : ls == LINK_NO_PLAYER ? "no_player" : "checking";
-  String j = "{";
-  j += "\"track\":" + String(currentTrack);
-  j += ",\"count\":" + String(trackCount);
-  j += ",\"playCmd\":" + String(PLAY_CMD);
-  j += ",\"link\":\"" + String(lk) + "\"";
-  j += ",\"error\":" + String((millis() - lastErrorAt < 5000) ? lastError : 0);
-  j += ",\"volume\":" + String(volume);
-  j += ",\"volumeMax\":" + String(VOLUME_MAX);
-  j += ",\"state\":\"" + String(st) + "\"";
-  j += ",\"repeat\":\"" + String(rp) + "\"";
-  j += ",\"wifi\":\"" + String(wifiSta ? "sta" : "ap") + "\"";
-  j += ",\"ip\":\"" + ipText + "\"";
-  j += ",\"queue\":" + String(qCount);
-  if (msg) j += ",\"msg\":\"" + String(msg) + "\"";
-  j += "}";
-  server.send(code, "application/json", j);
+  char buf[360];
+  int n = snprintf(buf, sizeof(buf),
+      "{\"track\":%u,\"count\":%u,\"playCmd\":%u,\"link\":\"%s\",\"error\":%u,"
+      "\"volume\":%u,\"volumeMax\":%u,\"state\":\"%s\",\"repeat\":\"%s\","
+      "\"wifi\":\"%s\",\"ip\":\"%s\",\"queue\":%u",
+      currentTrack, trackCount, PLAY_CMD, lk,
+      (unsigned)((millis() - lastErrorAt < 5000) ? lastError : 0),
+      volume, (unsigned)VOLUME_MAX, st, rp, wifiSta ? "sta" : "ap", ipText.c_str(), qCount);
+  if (msg && n > 0 && n < (int)sizeof(buf)) snprintf(buf + n, sizeof(buf) - n, ",\"msg\":\"%s\"", msg);
+  size_t len = strlen(buf);
+  if (len < sizeof(buf) - 2) { buf[len] = '}'; buf[len + 1] = 0; }
+  server.send(code, "application/json", buf);
+}
+
+static void sendHealth() {
+  char buf[420];
+  snprintf(buf, sizeof(buf),
+      "{\"uptime\":%lu,\"heapFree\":%u,\"heapMin\":%u,\"rssi\":%d,\"reset\":\"%s\","
+      "\"boots\":%lu,\"crashes\":%lu,\"txFrames\":%lu,\"rxFrames\":%lu,"
+      "\"queueDrops\":%lu,\"rejoins\":%lu,\"wifi\":\"%s\"}",
+      (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+      wifiSta ? WiFi.RSSI() : 0, resetReason,
+      (unsigned long)stats.boots, (unsigned long)stats.crashes, (unsigned long)stats.txFrames,
+      (unsigned long)stats.rxFrames, (unsigned long)stats.queueDrops, (unsigned long)stats.rejoins,
+      wifiSta ? "sta" : "ap");
+  server.send(200, "application/json", buf);
 }
 
 // Actions must carry a custom header. A web page on another site cannot add one without the
@@ -488,6 +607,7 @@ static void setupRoutes() {
 
   server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", INDEX_HTML); });
   server.on("/api/status", HTTP_GET, []() { sendStatus(); });
+  server.on("/api/health", HTTP_GET, []() { sendHealth(); });
 
   server.on("/api/play", HTTP_POST, []() {
     if (!apiGuard()) return;
@@ -574,9 +694,28 @@ static void setupRoutes() {
 
 // ---------------------------------------------------------------- main
 
+static void startWatchdog() {
+  esp_task_wdt_config_t cfg = {};
+  cfg.timeout_ms = WDT_TIMEOUT_MS;
+  cfg.idle_core_mask = 0;
+  cfg.trigger_panic = true;                 // restart the board if the main loop stalls
+  if (esp_task_wdt_reconfigure(&cfg) != ESP_OK) esp_task_wdt_init(&cfg);
+  esp_task_wdt_add(NULL);
+}
+
 void setup() {
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);                 // never stall when no computer is reading the USB serial
+  makeApPassword();
   loadState();
+
+  resetReason = resetReasonText();
+  stats.boots = prefs.getULong("boots", 0) + 1;
+  stats.crashes = prefs.getULong("crashes", 0) + (resetWasCrash() ? 1 : 0);
+  prefs.putULong("boots", stats.boots);
+  prefs.putULong("crashes", stats.crashes);
+  LOGE("Boot %lu, reset reason: %s, crashes so far: %lu\n",
+       (unsigned long)stats.boots, resetReason, (unsigned long)stats.crashes);
 
   u8g2.begin();
   showMessage("Pod Player", "starting...");
@@ -591,10 +730,12 @@ void setup() {
 
   startNetwork();
   setupRoutes();
-  Serial.printf("Pod Player ready: http://%s/  (%s)\n", ipText.c_str(), wifiSta ? "Wi-Fi" : "hotspot");
+  LOGE("Pod Player ready: http://%s/  (%s)\n", ipText.c_str(), wifiSta ? "Wi-Fi" : "hotspot");
+  startWatchdog();
 }
 
 void loop() {
+  esp_task_wdt_reset();
   server.handleClient();
   dfPoll();
   dfPump();
@@ -615,9 +756,5 @@ void loop() {
     drawScreen();
   }
 
-  static uint32_t lastRetry = 0;
-  if (wifiSta && WiFi.status() != WL_CONNECTED && millis() - lastRetry > 10000) {
-    lastRetry = millis();
-    WiFi.reconnect();
-  }
+  netTick();
 }

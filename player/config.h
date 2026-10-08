@@ -25,7 +25,8 @@
 // Network
 #define HOSTNAME              "thepod"             // http://thepod.local
 #define AP_SSID               "thepod-player"      // setup / fallback hotspot name
-#define AP_PASSWORD           "thepod-player-1"    // hotspot password (8+ characters)
+#define AP_PASSWORD           ""                   // empty = unique per device: "pod-" + 6 hex digits of the chip ID,
+                                                   // shown on the OLED. Set 8+ characters to override.
 #define PORTAL_TIMEOUT_S      300                  // how long the setup page stays open
 
 // Some ESP32-C3 SuperMini boards connect more reliably with a lower transmit power.
@@ -41,3 +42,14 @@
 #define TRACK_CHANGE_MIN_MS   300    // track changes requested faster than this are refused
 #define FINISH_IGNORE_MS      2000   // ignore "track finished" this soon after starting a track
 #define MAX_MISSING_SKIPS     3      // give up after this many missing files in a row
+
+// Logging: 0 off, 1 events (connection, errors, resets), 2 also every DFPlayer frame.
+// tools/test_controls.py needs level 2:  --build-property build.extra_flags=-DLOG_LEVEL=2
+#ifndef LOG_LEVEL
+#define LOG_LEVEL             1
+#endif
+
+// Reliability
+#define WDT_TIMEOUT_MS        15000  // restart if the main loop stalls this long
+#define NET_RETRY_MS          60000  // in fallback hotspot mode, try the saved Wi-Fi this often
+#define NET_JOIN_MS           20000  // how long each such attempt waits

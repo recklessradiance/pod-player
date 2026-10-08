@@ -8,6 +8,12 @@ input is refused, and that frames are spaced out.
 The Mac must reach the player over the network (same Wi-Fi as the player) and be connected to
 it by USB. Audio will play while this runs.
 
+The firmware must be built with frame logging on (production builds leave it off):
+
+  arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc player \\
+      --build-property "compiler.cpp.extra_flags=-DLOG_LEVEL=2"
+  arduino-cli upload  -p /dev/cu.usbmodemXXXX --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc player
+
 Usage:  python3 tools/test_controls.py http://172.20.10.2 [/dev/cu.usbmodemXXXX]
 """
 import glob
@@ -127,6 +133,13 @@ print("Start status:", s)
 if s.get("link") != "ok" or s.get("count", 0) < 3:
     sys.exit("Need link 'ok' and at least 3 tracks on the card for this test.")
 count, vmax, orig_vol, orig_rep = s["count"], s["volumeMax"], s["volume"], s["repeat"]
+
+print("\nHealth")
+code, h = call("/api/health", "GET")
+check("health endpoint answers", code == 200 and "uptime" in h, str(h))
+check("free heap is healthy (> 60 KB)", h.get("heapFree", 0) > 60000, str(h.get("heapFree")))
+check("lowest free heap since boot is healthy (> 40 KB)", h.get("heapMin", 0) > 40000, str(h.get("heapMin")))
+check("no crash resets recorded", h.get("crashes", 1) == 0, f"crashes {h.get('crashes')} (last reset: {h.get('reset')})")
 
 STOP, PLAY, PAUSE, SET_VOL = 0x16, s.get("playCmd", 0x12), 0x0E, 0x06
 RESUME = 0x0D
