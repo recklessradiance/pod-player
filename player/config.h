@@ -44,7 +44,7 @@
 #define MAX_MISSING_SKIPS     3      // give up after this many missing files in a row
 
 // Logging: 0 off, 1 events (connection, errors, resets), 2 also every DFPlayer frame.
-// tools/test_controls.py needs level 2:  --build-property build.extra_flags=-DLOG_LEVEL=2
+// tools/test_controls.py needs level 2: add  --build-property "compiler.cpp.extra_flags=-DLOG_LEVEL=2"
 #ifndef LOG_LEVEL
 #define LOG_LEVEL             1
 #endif

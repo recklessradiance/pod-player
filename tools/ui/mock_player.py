@@ -44,7 +44,10 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/__set":      # preview helper: /__set?link=no_sd&state=playing ...
             for k, v in parse_qs(u.query).items():
                 st[k] = int(v[0]) if v[0].lstrip("-").isdigit() else v[0]
-            if st["state"] == "playing" and not started[0]: started[0] = time.time() - 83
+            if st["state"] in ("playing", "paused"):      # a believable position: 1:24 into the track
+                started[0] = time.time() - 84
+                paused_accum[0] = 0
+                paused_at[0] = time.time()
             return self.send(200, body())
         self.send(404, "not found", "text/plain")
     def do_POST(self):
