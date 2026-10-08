@@ -92,6 +92,24 @@ static const char *blockReason() {
   }
 }
 
+// Elapsed play time. The module cannot report its position, so it is counted here (pauses excluded).
+static uint32_t playStartedAt = 0;
+static uint32_t pausedAccum = 0;
+static uint32_t pausedAt = 0;
+
+static uint32_t elapsedSeconds() {
+  if (state == STOPPED) return 0;
+  uint32_t until = (state == PAUSED) ? pausedAt : millis();
+  if (until < playStartedAt + pausedAccum) return 0;
+  return (until - playStartedAt - pausedAccum) / 1000;
+}
+
+// The module ignores some commands sent soon after power-up, so the volume is sent again once it
+// has settled, and again after a reset or a card change.
+static bool volumePending = true;
+static uint32_t volumeResendAt = VOLUME_RESEND_MS;
+static uint32_t lastModuleResetAt = 0;
+
 #if PLAY_BY_INDEX
 static const uint8_t PLAY_CMD = 0x03;      // Nth file on the card, any file names
 #else
@@ -186,6 +204,8 @@ static bool requestTrack(uint16_t n, int8_t dir, bool continuing, bool stopFirst
   dfEnqueue(PLAY_CMD, n);                  // start track n
   state = PLAYING;
   lastPlayCmdAt = millis();
+  playStartedAt = lastPlayCmdAt;
+  pausedAccum = 0;
   if (!continuing) {
     skipDir = dir;
     skipsLeft = MAX_MISSING_SKIPS;
@@ -200,6 +220,7 @@ static bool doPlay() {
   if (state == PAUSED) {
     if (dfQueueFree() < 2) return false;
     dfEnqueue(0x0D);                                       // resume
+    pausedAccum += millis() - pausedAt;
     state = PLAYING;
     return true;
   }
@@ -209,6 +230,7 @@ static bool doPlay() {
 static void doPause() {
   if (state != PLAYING) return;                            // pausing only makes sense while playing
   dfEnqueue(0x0E);
+  pausedAt = millis();
   state = PAUSED;
 }
 
@@ -229,6 +251,26 @@ static void setVolume(long v) {
 static void setRepeat(RepeatMode m) {
   repeatMode = m;
   markDirty();
+}
+
+// Resets the DFPlayer and re-reads the card. Refused if done too recently or the queue is busy.
+static bool resetModule() {
+  if (lastModuleResetAt != 0 && millis() - lastModuleResetAt < MODULE_RESET_MIN_MS) return false;
+  if (dfQueueFree() < 6) return false;
+  lastModuleResetAt = millis();
+  doStop();
+  if (TRACK_COUNT_OVERRIDE == 0) {
+    trackCount = 0;
+    countKnown = false;
+  }
+  sdFlag = -1;
+  queries = 0;
+  dfEnqueue(0x0C, 0, 3000);        // reset; the module needs about 3 s to come back
+  dfEnqueue(0x09, 2, 300);         // source: SD card
+  dfEnqueue(0x06, volume);         // a reset puts the module back to full volume: set ours at once
+  volumePending = true;
+  volumeResendAt = millis() + 4500;
+  return true;
 }
 
 static void onTrackFinished() {
@@ -273,6 +315,8 @@ static void dfHandle(uint8_t cmd, uint16_t param) {
         sdFlag = 1;
         countKnown = (TRACK_COUNT_OVERRIDE != 0);   // forget any count taken while the card was out
         queries = 0;
+        volumePending = true;                       // the module has just (re)started: set the volume again
+        volumeResendAt = millis() + 1500;
       } else if (param == 0) {
         sdFlag = 0;
       }
@@ -282,6 +326,8 @@ static void dfHandle(uint8_t cmd, uint16_t param) {
         sdFlag = 1;
         countKnown = (TRACK_COUNT_OVERRIDE != 0);
         queries = 0;
+        volumePending = true;
+        volumeResendAt = millis() + 1500;
       }
       break;
     case 0x3B:                     // storage removed (2 = SD card)
@@ -392,7 +438,12 @@ static void drawScreen() {
 
   u8g2.setFont(u8g2_font_6x10_tr);
   switch (linkState()) {
-    case LINK_OK:        snprintf(buf, sizeof(buf), "of %u", trackCount); break;
+    case LINK_OK: {
+      uint32_t e = elapsedSeconds();
+      if (state == STOPPED) snprintf(buf, sizeof(buf), "of %u", trackCount);
+      else snprintf(buf, sizeof(buf), "of %u  %u:%02u", trackCount, (unsigned)(e / 60), (unsigned)(e % 60));
+      break;
+    }
     case LINK_EMPTY:     snprintf(buf, sizeof(buf), "NO TRACKS"); break;
     case LINK_NO_SD:     snprintf(buf, sizeof(buf), "NO SD CARD"); break;
     case LINK_NO_PLAYER: snprintf(buf, sizeof(buf), "NO DFPLAYER"); break;
@@ -425,6 +476,19 @@ static void makeApPassword() {
 }
 
 static void startNetwork() {
+#if WIFI_MEMORY == 2
+  const bool forget = true;
+#elif WIFI_MEMORY == 1
+  const bool forget = (esp_reset_reason() == ESP_RST_POWERON || esp_reset_reason() == ESP_RST_BROWNOUT);
+#else
+  const bool forget = false;
+#endif
+  if (forget) {
+    WiFiManager eraser;
+    eraser.resetSettings();                 // erase the saved network: the setup portal opens
+    LOGE("Saved Wi-Fi network erased; asking for it again\n");
+  }
+
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
 #if LOWER_WIFI_TX_POWER
@@ -483,6 +547,8 @@ static void netTick() {
     }
     return;
   }
+
+  if (WIFI_MEMORY == 2) return;               // nothing is remembered, so there is nothing to retry
 
   if (!trying) {
     if (now - lastRetry > NET_RETRY_MS) {
@@ -544,14 +610,14 @@ static void sendStatus(int code = 200, const char *msg = nullptr) {
   LinkState ls = linkState();
   const char *lk = ls == LINK_OK ? "ok" : ls == LINK_EMPTY ? "empty" : ls == LINK_NO_SD ? "no_sd"
                  : ls == LINK_NO_PLAYER ? "no_player" : "checking";
-  char buf[360];
+  char buf[400];
   int n = snprintf(buf, sizeof(buf),
       "{\"track\":%u,\"count\":%u,\"playCmd\":%u,\"link\":\"%s\",\"error\":%u,"
       "\"volume\":%u,\"volumeMax\":%u,\"state\":\"%s\",\"repeat\":\"%s\","
-      "\"wifi\":\"%s\",\"ip\":\"%s\",\"queue\":%u",
+      "\"wifi\":\"%s\",\"ip\":\"%s\",\"queue\":%u,\"elapsed\":%u",
       currentTrack, trackCount, PLAY_CMD, lk,
       (unsigned)((millis() - lastErrorAt < 5000) ? lastError : 0),
-      volume, (unsigned)VOLUME_MAX, st, rp, wifiSta ? "sta" : "ap", ipText.c_str(), qCount);
+      volume, (unsigned)VOLUME_MAX, st, rp, wifiSta ? "sta" : "ap", ipText.c_str(), qCount, (unsigned)elapsedSeconds());
   if (msg && n > 0 && n < (int)sizeof(buf)) snprintf(buf + n, sizeof(buf) - n, ",\"msg\":\"%s\"", msg);
   size_t len = strlen(buf);
   if (len < sizeof(buf) - 2) { buf[len] = '}'; buf[len + 1] = 0; }
@@ -679,6 +745,10 @@ static void setupRoutes() {
     dfEnqueue(0x09, 2, 300);
     sendStatus();
   });
+  server.on("/api/reset-module", HTTP_POST, []() {
+    if (!apiGuard()) return;
+    if (!resetModule()) sendStatus(429, "wait before resetting again"); else sendStatus();
+  });
   server.on("/api/wifi-reset", HTTP_POST, []() {
     if (!apiGuard()) return;
     server.send(200, "text/plain", "Wi-Fi settings cleared; restarting into setup");
@@ -740,6 +810,11 @@ void loop() {
   dfPoll();
   dfPump();
   saveIfDue();
+
+  if (volumePending && (int32_t)(millis() - volumeResendAt) >= 0 && dfQueueFree() > 1) {
+    volumePending = false;
+    dfEnqueue(0x06, volume);
+  }
 
   // The DFPlayer needs a few seconds to read the card; keep asking until it answers.
   static uint32_t lastQuery = 0;

@@ -53,3 +53,15 @@
 #define WDT_TIMEOUT_MS        15000  // restart if the main loop stalls this long
 #define NET_RETRY_MS          60000  // in fallback hotspot mode, try the saved Wi-Fi this often
 #define NET_JOIN_MS           20000  // how long each such attempt waits
+
+// Power-up and reset behaviour
+#define VOLUME_RESEND_MS      4500   // send the volume again this long after power-up: the module ignores early commands
+#define MODULE_RESET_MIN_MS   10000  // refuse module resets closer together than this
+
+// Does the player remember the Wi-Fi network?
+//   0 = remember it (reconnect by itself at start-up)
+//   1 = forget it at every power-up, but keep it across restarts after a crash or watchdog reset
+//   2 = forget it at every start: the setup portal opens each time and nothing is remembered
+// The library writes the network to flash when you save it in the portal; "forgetting" means it is
+// erased at the start of the next boot.
+#define WIFI_MEMORY           2

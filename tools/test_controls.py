@@ -144,6 +144,33 @@ check("no crash resets recorded", h.get("crashes", 1) == 0, f"crashes {h.get('cr
 STOP, PLAY, PAUSE, SET_VOL = 0x16, s.get("playCmd", 0x12), 0x0E, 0x06
 RESUME = 0x0D
 
+print("\nElapsed time")
+call("/api/stop")
+time.sleep(0.8)
+check("stopped: elapsed is 0", status().get("elapsed") == 0, str(status().get("elapsed")))
+call("/api/play")
+time.sleep(3.2)
+e1 = status().get("elapsed")
+check("playing: elapsed advances (about 3 s)", e1 is not None and 2 <= e1 <= 5, str(e1))
+call("/api/pause")
+time.sleep(0.5)
+p1 = status().get("elapsed")
+time.sleep(2.2)
+p2 = status().get("elapsed")
+check("paused: elapsed holds still", p1 == p2, f"{p1} -> {p2}")
+call("/api/play")
+time.sleep(2.2)
+r = status().get("elapsed")
+check("resume continues from where it paused", r is not None and p2 <= r <= p2 + 4, f"{p2} -> {r}")
+call("/api/stop")
+time.sleep(0.8)
+check("stop: elapsed back to 0", status().get("elapsed") == 0, str(status().get("elapsed")))
+call("/api/next")
+time.sleep(1.0)
+check("a new track starts counting from 0", status().get("elapsed", 99) <= 2, str(status().get("elapsed")))
+call("/api/stop")
+time.sleep(0.8)
+
 print("\nTransport")
 call("/api/stop")
 time.sleep(0.8)
@@ -200,6 +227,24 @@ for _ in range(3):
 check("repeat cycles off -> all -> one -> off", modes == ["all", "one", "off"], str(modes))
 check("repeat mode=one sets one", call("/api/repeat?mode=one")[1]["repeat"] == "one")
 call(f"/api/repeat?mode={orig_rep}")
+
+print("\nModule reset")
+mark = time.time()
+code, body = call("/api/reset-module")
+time.sleep(7.0)
+got = [(c, p) for (_, c, p) in frames_since(mark)]
+if got and got[0] == (STOP, 0):
+    got = got[1:]                      # a stop is sent first if something was playing
+vol_now = status().get("volume")
+ok = code == 200 and got[:3] == [(0x0C, 0), (0x09, 2), (SET_VOL, vol_now)] \
+     and all(c in (SET_VOL, 0x48) for c, _ in got[3:])
+check("reset-module: reset, select SD, restore volume, then only volume or count queries", ok,
+      f"code {code}, frames {[(hex(c), p) for c, p in got]}")
+s2 = status()
+check("the card is re-read after the reset (link ok, same count)",
+      s2.get("link") == "ok" and s2.get("count") == count, str(s2))
+code2, _ = call("/api/reset-module")
+check("a second reset right away is refused (429)", code2 == 429, str(code2))
 
 print("\nGuards")
 step("action without the X-Pod header is refused (403)", "/api/next", [], expect_code=403, header=False, wait=0.5)
